@@ -19,7 +19,15 @@ AI agents can make mistakes. Incorrect commands or actions due to AI hallucinati
 - **Real-time Operational Insight**: Get logs and monitor service status.
 - **Interactive Debugging**: Open and interact with remote Docker container terminals.
 - **Multi-Agent Support**: Manage stacks across multiple Dockge agents/endpoints.
-- **Efficient & Persistent**: Intelligent authentication and connection management.
+
+## Demo
+LLM running commands in a exec shell:
+
+https://github.com/user-attachments/assets/4482c7e3-cc97-4d2b-9d26-e7126b134435
+
+Deploying a Wordpress stack:
+
+https://github.com/user-attachments/assets/dde4c5b4-d343-42bd-9852-7cfe286ece88
 
 
 ## Getting Started
