@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  dockge-mcp:
+    build: 
+      context: https://github.com/wonderchatai/dockge-mcp.git#main
+      dockerfile: Dockerfile
+    image: dockge-mcp:latest
+    container_name: dockge-mcp
+    ports:
+      - "8000:8000"
+    environment:
+      - DOCKGE_URL=${DOCKGE_URL:-http://localhost:5001}
+      - DOCKGE_USERNAME=${DOCKGE_USERNAME:-admin}
+      - DOCKGE_PASSWORD=${DOCKGE_PASSWORD:-password}
+    env_file:
+      - .env
+    restart: unless-stopped
