@@ -8,7 +8,7 @@ AI agents can make mistakes. Incorrect commands or actions due to AI hallucinati
 
 ## Why Dockge?
 
--   Stacks are funner than single containers.
+-   Stacks are funner than single container.
 -   Has exec shell.
 -   Multi-cluster and easy remote integration.
 
