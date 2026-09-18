@@ -2,8 +2,11 @@ name: Build and Release Docker Image
 
 on:
   push:
+    branches:
+      - main
     tags:
-      - 'v*.*.*' # Trigger on tags like v1.0.0
+      - 'v*.*.*'
+  workflow_dispatch:
 
 jobs:
   build-and-push-docker-image:
@@ -29,6 +32,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}

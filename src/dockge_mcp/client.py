@@ -1,252 +1,228 @@
+"""Resilient Dockge Socket.IO client for the upstream Dockge MCP server."""
+
 import asyncio
 import time
+from collections import deque
+from typing import Any
+
 import jwt
 import socketio
-from .settings import settings
-from collections import deque
 
-ALL_ENDPOINTS = "##ALL_DOCKGE_ENDPOINTS##"
+from .settings import settings
+
 
 class TokenCache:
-    def __init__(self):
+    def __init__(self) -> None:
         self.token: str | None = None
-        self.decoded_token: dict | None = None
+        self.decoded_token: dict[str, Any] | None = None
 
     def get(self) -> str | None:
-        """Returns the token if it's not expired."""
-        if self.token and self.decoded_token:
-            # Check if 'exp' (expiration time) exists and is in the future
-            if "exp" in self.decoded_token and self.decoded_token["exp"] > time.time():
-                return self.token
+        if not self.token or not self.decoded_token:
+            return None
+        expires = self.decoded_token.get("exp")
+        if isinstance(expires, (int, float)) and expires > time.time() + 30:
+            return self.token
+        self.clear()
         return None
 
-    def set(self, token: str):
-        """Sets and decodes the token."""
-        self.token = token
+    def set(self, token: str) -> None:
         try:
-            # Decode without verification to inspect claims like expiration
-            self.decoded_token = jwt.decode(token, options={"verify_signature": False})
-        except jwt.DecodeError:
-            self.decoded_token = None
-            self.token = None
+            decoded = jwt.decode(token, options={"verify_signature": False})
+        except (jwt.DecodeError, TypeError):
+            self.clear()
+        else:
+            self.token = token
+            self.decoded_token = decoded
+
+    def clear(self) -> None:
+        self.token = None
+        self.decoded_token = None
+
 
 class DockgeClient:
-    def __init__(self):
-        self.sio = socketio.AsyncClient(logger=False, engineio_logger=False) # Disable logging
+    def __init__(self) -> None:
+        self.sio = socketio.AsyncClient(
+            logger=False,
+            engineio_logger=False,
+            reconnection=True,
+            reconnection_attempts=0,
+            reconnection_delay=1,
+            reconnection_delay_max=10,
+        )
         self.token_cache = TokenCache()
-        self.connected = False
         self.authenticated = False
-        self.terminal_log_sessions: dict[str, deque] = {}
+        self._connection_lock = asyncio.Lock()
+        self.terminal_log_sessions: dict[str, deque[str]] = {}
+        self.all_agent_stack_lists: dict[str, Any] = {}
 
-        self.all_agent_stack_lists = {}  # Stores stack lists from all agents
+        @self.sio.event
+        async def connect() -> None:
+            # Every Socket.IO connection needs a fresh Dockge authentication.
+            self.authenticated = False
 
-        # Add catch-all listener for debugging
-        @self.sio.on("*")
-        def catch_all(event, data):
-            pass
+        @self.sio.event
+        async def disconnect() -> None:
+            self.authenticated = False
 
-        # Persistent listener for "agent" events
         @self.sio.on("agent")
-        def persistent_agent_listener(sub_event_name, data, third_arg=None):
-            if sub_event_name == "stackList":
-                endpoint = data.get("endpoint", "") # Default to empty string for primary
+        def persistent_agent_listener(
+            sub_event_name: str, data: Any, third_arg: Any = None
+        ) -> None:
+            if sub_event_name == "stackList" and isinstance(data, dict):
+                endpoint = data.get("endpoint", "")
                 self.all_agent_stack_lists[endpoint] = data.get("stackList", {})
             elif sub_event_name == "terminalWrite":
                 terminal_name = data
-                log_chunk = third_arg
-                if terminal_name in self.terminal_log_sessions and log_chunk is not None:
-                    self.terminal_log_sessions[terminal_name].append(log_chunk)
-            else:
-                pass
+                if terminal_name in self.terminal_log_sessions and third_arg is not None:
+                    self.terminal_log_sessions[terminal_name].append(str(third_arg))
 
-    async def start_log_session(self, terminal_name: str):
-        """
-        Initializes a new log session for a terminal, fetching the initial buffer.
-        """
-        await self._connect_and_authenticate()
+    async def _connect_and_authenticate(self) -> None:
+        async with self._connection_lock:
+            if not self.sio.connected:
+                self.authenticated = False
+                last_error: Exception | None = None
+                for attempt in range(5):
+                    try:
+                        await self.sio.connect(
+                            str(settings.dockge_url), wait=True, wait_timeout=10
+                        )
+                        break
+                    except Exception as error:
+                        last_error = error
+                        if self.sio.connected:
+                            await self.sio.disconnect()
+                        if attempt < 4:
+                            await asyncio.sleep(min(2**attempt, 8))
+                else:
+                    raise ConnectionError(
+                        f"Dockge ist nach 5 Versuchen nicht erreichbar: {last_error}"
+                    ) from last_error
 
-        # Create a new deque with a max length of 100 chunks
-        log_deque = deque(maxlen=100)
-        self.terminal_log_sessions[terminal_name] = log_deque
+            if self.authenticated:
+                return
 
-        callback_future = asyncio.Future()
-        def event_callback(data):
-            if not callback_future.done():
-                callback_future.set_result(data)
-
-        await self.sio.emit(
-            "agent",
-            ("", "terminalJoin", terminal_name),
-            callback=event_callback,
-        )
-
-        try:
-            result = await asyncio.wait_for(callback_future, timeout=10.0)
-            if result.get("ok"):
-                buffer_content = result.get("buffer", "")
-                if buffer_content:
-                    # Append the whole initial buffer as one chunk
-                    log_deque.append(buffer_content)
-        except (asyncio.TimeoutError, Exception):
-            # Fail silently, subsequent terminalWrite events will still populate the log
-            pass
-
-    async def _connect_and_authenticate(self):
-        if not self.connected:
-            await self.sio.connect(str(settings.dockge_url))
-            self.connected = True
-
-        if not self.authenticated:
             cached_token = self.token_cache.get()
             if cached_token:
-                auth_future = asyncio.Future()
-                def auth_callback(data):
-                    if not auth_future.done():
-                        auth_future.set_result(data)
-                await self.sio.emit("loginByToken", cached_token, callback=auth_callback)
-                auth_result = await asyncio.wait_for(auth_future, timeout=10.0)
-                if auth_result.get("ok"):
+                result = await self._emit_with_callback("loginByToken", cached_token, 10)
+                if result.get("ok"):
                     self.authenticated = True
                     return
-                else:
-                    self.token_cache.set(None) # Clear invalid token
+                self.token_cache.clear()
 
-            # Perform full login if not authenticated or cached token failed
-            login_future = asyncio.Future()
-            def login_callback(data):
-                if not login_future.done():
-                    login_future.set_result(data)
-
-            await self.sio.emit("login", {
-                "username": settings.dockge_username,
-                "password": settings.dockge_password,
-            }, callback=login_callback)
-
-            login_result = await asyncio.wait_for(login_future, timeout=10.0)
-
-            if login_result.get("ok") and login_result.get("token"):
-                token = login_result["token"]
-                self.token_cache.set(token)
-                self.authenticated = True
-            else:
-                raise ConnectionRefusedError(f"Dockge login failed: {login_result.get('msg')}")
-
-    async def _call_api(self, event_name: str, *args, endpoint: str = ""):
-        await self._connect_and_authenticate()
-
-        # Special handling for requestStackList to capture the broadcasted list
-        if event_name == "requestStackList":
-            return {"ok": True, "stackList": self.all_agent_stack_lists}
-
-        else:
-            # For other events, use the existing callback mechanism
-            callback_future = asyncio.Future()
-            def event_callback(data):
-                if not callback_future.done():
-                    callback_future.set_result(data)
-
-            await self.sio.emit(
-                "agent",
-                (endpoint, event_name, *args),
-                callback=event_callback,
+            result = await self._emit_with_callback(
+                "login",
+                {
+                    "username": settings.dockge_username,
+                    "password": settings.dockge_password,
+                },
+                10,
             )
+            if not result.get("ok") or not result.get("token"):
+                raise ConnectionRefusedError(
+                    f"Dockge-Anmeldung fehlgeschlagen: {result.get('msg', 'unbekannt')}"
+                )
+            self.token_cache.set(result["token"])
+            self.authenticated = True
 
-            # 4. Wait for the result
-            result = await asyncio.wait_for(callback_future, timeout=30.0)
-            return result
+    async def _emit_with_callback(
+        self, event: str, data: Any, timeout: float
+    ) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
 
-    async def disconnect(self):
-        if self.connected:
-            print("DEBUG: Disconnecting from Dockge server...")
-            await self.sio.disconnect()
-            self.connected = False
-            self.authenticated = False
+        def callback(result: dict[str, Any]) -> None:
+            if not future.done():
+                future.set_result(result)
 
-    async def get_terminal_log_lines(self, terminal_name: str, last_x_lines: int = 50) -> list[str]:
-        """
-        Fetches the last X Docker container terminal log lines directly from the Dockge server.
-        Max history is determined by the Dockge server's buffer (typically 100 chunks).
-        """
-        # 1. Check for an active log session
-        if terminal_name in self.terminal_log_sessions:
-            buffered_chunks = list(self.terminal_log_sessions[terminal_name])
-            full_log = "".join(buffered_chunks)
-            lines = full_log.splitlines()
-            return lines[-last_x_lines:]
+        await self.sio.emit(event, data, callback=callback)
+        return await asyncio.wait_for(future, timeout=timeout)
 
-        # 2. Fallback to original on-demand fetching for other terminals
-        await self._connect_and_authenticate()
-
-        callback_future = asyncio.Future()
-        def event_callback(data):
-            if not callback_future.done():
-                callback_future.set_result(data)
-
-        await self.sio.emit(
-            "agent",
-            ("", "terminalJoin", terminal_name),
-            callback=event_callback,
+    async def _agent_call(
+        self, endpoint: str, event_name: str, *args: Any, timeout: float = 30
+    ) -> dict[str, Any]:
+        return await self._emit_with_callback(
+            "agent", (endpoint, event_name, *args), timeout
         )
-        
+
+    async def _call_api(
+        self, event_name: str, *args: Any, endpoint: str = ""
+    ) -> dict[str, Any]:
+        await self._connect_and_authenticate()
+        if event_name == "requestStackList":
+            # Dockge publishes stackList through the persistent agent listener.
+            await self._agent_call(endpoint, event_name)
+            await asyncio.sleep(0.25)
+            return {"ok": True, "stackList": self.all_agent_stack_lists}
+        return await self._agent_call(endpoint, event_name, *args)
+
+    async def start_log_session(self, terminal_name: str) -> None:
+        await self._connect_and_authenticate()
+        log_deque: deque[str] = deque(maxlen=100)
+        self.terminal_log_sessions[terminal_name] = log_deque
         try:
-            result = await asyncio.wait_for(callback_future, timeout=10.0)
+            result = await self._agent_call("", "terminalJoin", terminal_name, timeout=10)
+            if result.get("ok") and result.get("buffer"):
+                log_deque.append(str(result["buffer"]))
+        except (asyncio.TimeoutError, socketio.exceptions.SocketIOError):
+            # Live terminalWrite events can still fill the buffer.
+            pass
 
-            if result.get("ok"):
-                buffer_content = result.get("buffer", "")
-                lines = buffer_content.splitlines()
-                return lines[-last_x_lines:]
-            else:
-                error_msg = result.get("msg", "Unknown error from Dockge")
-                return [f"Error fetching logs: {error_msg}"]
-                
+    async def get_terminal_log_lines(
+        self, terminal_name: str, last_x_lines: int = 50
+    ) -> list[str]:
+        if terminal_name in self.terminal_log_sessions:
+            lines = "".join(self.terminal_log_sessions[terminal_name]).splitlines()
+            return lines[-last_x_lines:]
+        await self._connect_and_authenticate()
+        try:
+            result = await self._agent_call("", "terminalJoin", terminal_name, timeout=10)
         except asyncio.TimeoutError:
-            return ["Error: Timed out waiting for log buffer from Dockge."]
-        except Exception as e:
-            return [f"An unexpected error occurred: {e}"]
+            return ["Error: Zeitüberschreitung beim Abrufen des Dockge-Logs."]
+        if not result.get("ok"):
+            return [f"Error fetching logs: {result.get('msg', 'Unknown error from Dockge')}"]
+        return str(result.get("buffer", "")).splitlines()[-last_x_lines:]
 
-    async def start_interactive_terminal(self, stack_name: str, service_name: str, endpoint: str = "", shell: str = "bash") -> dict:
-        """
-        Starts an interactive terminal session for a Docker container.
-        """
+    async def start_interactive_terminal(
+        self,
+        stack_name: str,
+        service_name: str,
+        endpoint: str = "",
+        shell: str = "bash",
+    ) -> dict[str, Any]:
         await self._connect_and_authenticate()
-        callback_future = asyncio.Future()
-        def event_callback(data):
-            if not callback_future.done():
-                callback_future.set_result(data)
-
-        await self.sio.emit(
-            "agent",
-            (endpoint, "interactiveTerminal", stack_name, service_name, shell),
-            callback=event_callback,
+        return await self._agent_call(
+            endpoint, "interactiveTerminal", stack_name, service_name, shell
         )
-        result = await asyncio.wait_for(callback_future, timeout=30.0)
-        return result
 
-    async def send_terminal_input(self, terminal_name: str, command: str, endpoint: str = "") -> dict:
-        """
-        Sends a command to an active interactive terminal session.
-        This is an emit-and-forget operation; terminal output is received via 'terminalWrite' events.
-        """
+    async def send_terminal_input(
+        self, terminal_name: str, command: str, endpoint: str = ""
+    ) -> dict[str, Any]:
         await self._connect_and_authenticate()
-        # Ensure the command ends with a carriage return for shell execution
-        if not command.endswith('\r'):
-            command += '\r'
-
+        if not command.endswith("\r"):
+            command += "\r"
         await self.sio.emit(
-            "agent",
-            (endpoint, "terminalInput", terminal_name, command),
+            "agent", (endpoint, "terminalInput", terminal_name, command)
         )
-        return {"ok": True} # Assume success for emit-and-forget
+        return {"ok": True}
 
-# Create a global instance of the client
+    async def disconnect(self) -> None:
+        self.authenticated = False
+        if self.sio.connected:
+            await self.sio.disconnect()
+
+
 dockge_client = DockgeClient()
 
-async def call_dockge_api(event_name: str, *args, endpoint: str = ""):
-    """
-    Connects to Dockge, authenticates, and emits an event to a specific endpoint.
-    Manages the JWT lifecycle by logging in once and reusing the token.
-    """
+
+async def call_dockge_api(
+    event_name: str, *args: Any, endpoint: str = ""
+) -> dict[str, Any]:
     try:
         return await dockge_client._call_api(event_name, *args, endpoint=endpoint)
-    except Exception as e:
-        return {"ok": False, "msg": f"An error occurred while communicating with Dockge: {str(e)}"}
+    except Exception as error:
+        # A failed connection must never poison subsequent tool calls.
+        dockge_client.authenticated = False
+        return {
+            "ok": False,
+            "msg": f"An error occurred while communicating with Dockge: {error}",
+        }

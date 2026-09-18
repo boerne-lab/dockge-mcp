@@ -40,4 +40,4 @@ USER nonroot
 WORKDIR /app
 
 # Run the FastAPI application by default
-CMD ["dockge-server"]
+CMD ["python", "-m", "dockge_mcp.stable_server"]

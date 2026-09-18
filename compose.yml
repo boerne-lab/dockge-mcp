@@ -2,14 +2,22 @@ version: '3.8'
 
 services:
   dockge-mcp:
-    image: ghcr.io/wonderchatai/dockge-mcp:latest
+    image: ghcr.io/boerne-lab/dockge-mcp:latest
     container_name: dockge-mcp
     ports:
-      - "8000:8000"
+      - "8001:8000"
     environment:
-      - DOCKGE_URL=${DOCKGE_URL:-http://localhost:5001}
-      - DOCKGE_USERNAME=${DOCKGE_USERNAME:-admin}
-      - DOCKGE_PASSWORD=${DOCKGE_PASSWORD:-password}
+      - DOCKGE_URL=${DOCKGE_URL:?DOCKGE_URL must be set}
+      - DOCKGE_USERNAME=${DOCKGE_USERNAME:?DOCKGE_USERNAME must be set}
+      - DOCKGE_PASSWORD=${DOCKGE_PASSWORD:?DOCKGE_PASSWORD must be set}
     env_file:
       - .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8000),3); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    init: true
+    stop_grace_period: 15s
     restart: unless-stopped
