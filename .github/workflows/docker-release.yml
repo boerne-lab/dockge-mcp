@@ -1,12 +1,8 @@
 name: Build and Release Docker Image
 
 on:
-  push:
-    branches:
-      - main
-    tags:
-      - 'v*.*.*'
   workflow_dispatch:
+
 
 jobs:
   build-and-push-docker-image:
